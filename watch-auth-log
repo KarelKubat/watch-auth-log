@@ -1,0 +1,99 @@
+#!/usr/bin/env perl
+
+use strict;
+use Getopt::Std;
+
+# Flags and defaults
+my $chain = 'INPUT';
+my $logfile = '/var/log/auth.log';
+my $port = 22;
+my $tryout = 0;
+my $TTL = 900;
+my $whitelist = '85.195.228.117';
+my %opts = (
+    c => $chain,     # iptables chain to operate on
+    l => $logfile,   # logfile to watch
+    p => $port,      # SSHD port
+    t => $tryout,    # tryout mode
+    T => $TTL,       # TTL of blocks in sec
+    w => $whitelist, # comma-separated IPs never to block
+);
+
+# Main starts here
+getopts('c:l:p:tT:w:', \%opts) or die <<"END";
+Usage: watch-auth-log [FLAGS]
+Flags may be:
+  -c CHAIN   (iptables chain to operate on, default: $chain)
+  -l LOGFILE (logfile to watch, default: $logfile)
+  -p PORT    (SSH port, default: $port)
+  -t         (tryout mode, set to 1 for dry run)
+  -T TTLSEC  (block duration, default: $TTL)
+END
+
+# Avoid listening to stdin incase someone uses -l ''
+error("missing value for -l") unless ($opts{l});
+
+# Cache of blocked IPs
+my @cache;
+
+# Whitelisted IPs for faster lookup.
+my %white;
+for my $w (split(/,/, $opts{w})) {
+    $white{$w} = 1;
+}
+
+open(my $if, "tail -F $opts{l} |") or die("cannot `tail -T` on $opts{l}: $!");
+while (my $line = <$if>) {
+    clear_stale_blocks();
+    chomp($line);
+    # How to extract an IP address from a log line like this one:
+    # Apr 17 06:25:10 abcd sshd[21871]: Failed password for invalid user ubuntu from 133.130.118.86 port 46530 ssh2
+    #                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                             1st matcher
+    #                                                                          ^^^^^^                2nd matcher
+    #                                                                                              ^ cutoff after space
+    next unless ($line =~ m{Failed password for invalid user});
+    $line =~ s{.*Failed password for invalid user}{};
+    $line =~ s{.* from }{};
+    $line =~ s{\s.*}{};
+    setblock($line);
+}
+
+sub error {
+    die("watch-auth-log: ", @_, "\n")
+}
+
+sub setblock($) {
+    my $ip = shift;
+
+    if ($white{$ip}) {
+        print("not setting block on $ip (whitelisted)\n");
+        return;
+    }
+
+    my @entry = (time(), $ip);
+    push(@cache, \@entry);
+
+    if ($opts{t}) {
+        print("would set block for $ip (but not in try-out mode)\n");
+        return
+    }
+    print("setting block for $ip\n");
+    cmd("iptables -A $opts{c} -s $ip -p tcp --destination-port $opts{p} -j DROP");
+}
+
+sub clear_stale_blocks() {
+    while (1) {
+        return if (scalar(@cache) < 1);
+        my @first = @{ $cache[0] };
+        return if ($first[0] + $opts{T} > time());
+        my $ip = $first[1];
+        print("clearing block for $ip\n");
+        cmd("iptables -D $opts{c} -s $ip -p tcp --destination-port $opts{p} -j DROP");
+        shift(@cache)   
+    }
+}
+
+sub cmd($) {
+    my $cmd = shift;
+    system($cmd) and warn("watch-auth-log: $cmd failed: $!\n");
+}
